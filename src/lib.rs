@@ -36,6 +36,15 @@ pub mod memory_manager;
 #[deny(missing_docs)]
 pub mod module;
 pub mod object_file;
+// Note: #[llvm_versions(18..)] cannot be used on file modules (rust-lang/rust#54727)
+#[cfg(any(
+    feature = "llvm18-1",
+    feature = "llvm19-1",
+    feature = "llvm20-1",
+    feature = "llvm21-1",
+    feature = "llvm22-1"
+))]
+pub mod orc2;
 pub mod passes;
 pub mod targets;
 pub mod types;
