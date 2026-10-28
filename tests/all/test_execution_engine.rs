@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use inkwell::context::Context;
-use inkwell::execution_engine::{FunctionLookupError, RemoveModuleError};
+use inkwell::execution_engine::{DataLayoutError, FunctionLookupError, RemoveModuleError};
 use inkwell::memory_manager::McjitMemoryManager;
 use inkwell::module::Linkage;
 use inkwell::targets::{CodeModel, InitializationConfig, Target, TargetMachine};
@@ -252,15 +252,15 @@ fn test_add_remove_module() {
     assert!(ee.take_initial_loaded_module().is_none());
 
     // Module names need not be unique
-    let module2 = ee.add_module(context.create_module("mod2"));
-    let module3 = ee.add_module(context.create_module("mod2"));
+    let module2 = ee.add_module(context.create_module("mod2")).unwrap();
+    let module3 = ee.add_module(context.create_module("mod2")).unwrap();
 
     // A handle from another engine is rejected; that engine keeps its module
     let ee2 = context
         .create_module("other")
         .create_jit_execution_engine(OptimizationLevel::default())
         .unwrap();
-    let other = ee2.add_module(context.create_module("other2"));
+    let other = ee2.add_module(context.create_module("other2")).unwrap();
 
     let other = match ee.remove_module(other) {
         Err(RemoveModuleError::ModuleNotOwned(other)) => other,
@@ -309,7 +309,7 @@ fn test_static_constructors_without_modules() {
     let f = m.add_function("seven", i64_type.fn_type(&[], false), None);
     builder.position_at_end(context.append_basic_block(f, "entry"));
     builder.build_return(Some(&i64_type.const_int(7, false))).unwrap();
-    let later = ee.add_module(m);
+    let later = ee.add_module(m).unwrap();
     ee.run_static_constructors();
 
     let seven = unsafe { ee.get_function::<unsafe extern "C" fn() -> i64>("seven").unwrap() };
@@ -339,7 +339,7 @@ fn test_code_survives_module_removal() {
     let f = extra.add_function("seven", fn_type, None);
     builder.position_at_end(context.append_basic_block(f, "entry"));
     builder.build_return(Some(&i64_type.const_int(7, false))).unwrap();
-    let extra = ee.add_module(extra);
+    let extra = ee.add_module(extra).unwrap();
 
     let seven = unsafe { ee.get_function::<unsafe extern "C" fn() -> i64>("seven").unwrap() };
     assert_eq!(unsafe { seven.call() }, 7);
@@ -705,4 +705,233 @@ fn test_raw_module_and_engine_constructors() {
         interpreter.get_function_address("nothing").unwrap_err(),
         FunctionLookupError::JITNotEnabled
     );
+}
+
+#[test]
+fn test_data_layout_must_match_the_engine() {
+    use inkwell::module::Module;
+
+    /// `name() -> i64`, the offset of the `i64` in `{ i8, i64 }`, in a module with `data_layout`.
+    fn with_layout<'ctx>(context: &'ctx Context, name: &str, data_layout: &str) -> Module<'ctx> {
+        let module = context.create_module(name);
+        module.set_data_layout_str(data_layout);
+        let i64_type = context.i64_type();
+        let pair = context.struct_type(&[context.i8_type().into(), i64_type.into()], false);
+        let function = module.add_function(name, i64_type.fn_type(&[], false), None);
+        let builder = context.create_builder();
+        builder.position_at_end(context.append_basic_block(function, "entry"));
+        let indexes = [i64_type.const_zero(), context.i32_type().const_int(1, false)];
+        #[cfg(feature = "typed-pointers")]
+        let field = unsafe { pair.ptr_type(AddressSpace::default()).const_null().const_gep(&indexes) };
+        #[cfg(not(feature = "typed-pointers"))]
+        let field = unsafe {
+            context
+                .ptr_type(AddressSpace::default())
+                .const_null()
+                .const_gep(pair, &indexes)
+        };
+        builder.build_return(Some(&field.const_to_int(i64_type))).unwrap();
+        module
+    }
+    const FOREIGN: &str = "e-m:e-i64:32-n8:16:32:64-S128";
+
+    Target::initialize_native(&InitializationConfig::default()).expect("Failed to initialize native target");
+
+    let context = Context::create();
+    let ee = context
+        .create_module("main")
+        .create_jit_execution_engine(OptimizationLevel::None)
+        .unwrap();
+    let engine_layout = ee
+        .get_data_layout()
+        .get_string_representation()
+        .to_string_lossy()
+        .into_owned();
+
+    // A module with another layout is refused and given back, instead of ending the process when
+    // MCJIT would compile it
+    let refused = ee.add_module(with_layout(&context, "refused", FOREIGN)).unwrap_err();
+    assert_eq!(refused.module.get_name().to_str(), Ok("refused"));
+    assert_eq!(
+        refused.error,
+        DataLayoutError::LayoutMismatch {
+            module_data_layout: FOREIGN.to_owned(),
+            engine_data_layout: engine_layout.clone(),
+        }
+    );
+    assert!(refused.to_string().contains(FOREIGN));
+
+    // The engine's own layout, and no layout at all (MCJIT stamps its own), are accepted
+    let same = ee.add_module(with_layout(&context, "same", &engine_layout)).unwrap();
+    let none = context.create_module("none");
+    let i64_type = context.i64_type();
+    let function = none.add_function("none", i64_type.fn_type(&[], false), None);
+    let builder = context.create_builder();
+    builder.position_at_end(context.append_basic_block(function, "entry"));
+    builder.build_return(Some(&i64_type.const_int(0, false))).unwrap();
+    let none = ee.add_module(none).unwrap();
+
+    let offset = unsafe { ee.get_function::<unsafe extern "C" fn() -> i64>("same").unwrap() };
+    assert_eq!(unsafe { offset.call() }, 8);
+    let none = ee.remove_module(none).unwrap();
+    assert_eq!(
+        none.get_data_layout().get_string_representation().to_str(),
+        Ok(engine_layout.as_str())
+    );
+    drop(ee.remove_module(same).unwrap());
+
+    // An engine created around a module with another layout is refused too
+    let error = with_layout(&context, "first", FOREIGN)
+        .create_jit_execution_engine(OptimizationLevel::None)
+        .unwrap_err();
+    assert!(error.to_string().contains(FOREIGN), "{error}");
+
+    // The interpreter runs under the host's layout too, which MCJIT's is: another one is refused,
+    // first or added, as the interpreter's memory is shared with native code
+    let error = with_layout(&context, "first", FOREIGN)
+        .create_interpreter_execution_engine()
+        .unwrap_err();
+    assert!(error.to_string().contains(FOREIGN), "{error}");
+    let interpreter = with_layout(&context, "first", &engine_layout)
+        .create_interpreter_execution_engine()
+        .unwrap();
+    assert_eq!(
+        interpreter.get_data_layout().get_string_representation().to_str(),
+        Ok(engine_layout.as_str())
+    );
+    let refused = interpreter
+        .add_module(with_layout(&context, "foreign", FOREIGN))
+        .unwrap_err();
+    assert_eq!(refused.module.get_name().to_str(), Ok("foreign"));
+    let same = interpreter
+        .add_module(with_layout(&context, "same", &engine_layout))
+        .unwrap();
+    let function = interpreter.get_function_value("same").unwrap();
+    assert_eq!(unsafe { interpreter.run_function(function, &[]) }.as_int(false), 8);
+    drop(interpreter.remove_module(same).unwrap());
+
+    // Modules without a layout, first or added, are given the host's
+    let interpreter = context
+        .create_module("main")
+        .create_interpreter_execution_engine()
+        .unwrap();
+    assert_eq!(
+        interpreter.get_data_layout().get_string_representation().to_str(),
+        Ok(engine_layout.as_str())
+    );
+    let explicit = interpreter
+        .add_module(with_layout(&context, "explicit", &engine_layout))
+        .unwrap();
+    let empty = interpreter.add_module(context.create_module("empty")).unwrap();
+    let empty = interpreter.remove_module(empty).unwrap();
+    assert_eq!(
+        empty.get_data_layout().get_string_representation().to_str(),
+        Ok(engine_layout.as_str())
+    );
+    drop(interpreter.remove_module(explicit).unwrap());
+}
+
+/// The interpreter stores every pointer as a host pointer, into a slot of the layout's size for
+/// its address space. x86-64's layout has 32-bit address spaces 270 and 271: a module using them
+/// is refused by the interpreter, before its constructor stores the module's globals, and
+/// accepted by MCJIT.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_interpreter_refuses_address_spaces_of_another_pointer_size() {
+    use inkwell::module::Module;
+
+    const POINTER_SIZE: DataLayoutError = DataLayoutError::PointerSize {
+        address_space: 270,
+        size: 4,
+        host_size: 8,
+    };
+
+    /// A global `ptr addrspace(270)`, which `emitGlobals` would store 8 bytes into.
+    fn global(context: &Context) -> Module<'_> {
+        let module = context.create_module("global");
+        #[cfg(feature = "typed-pointers")]
+        let pointer_type = context.i8_type().ptr_type(AddressSpace::from(270));
+        #[cfg(not(feature = "typed-pointers"))]
+        let pointer_type = context.ptr_type(AddressSpace::from(270));
+        let pointer = module.add_global(pointer_type, None, "pointer");
+        pointer.set_initializer(&pointer_type.const_null());
+        module
+    }
+
+    /// The address space only in an `alloca` of a function.
+    fn alloca(context: &Context) -> Module<'_> {
+        let module = context.create_module("alloca");
+        let function = module.add_function("alloca", context.void_type().fn_type(&[], false), None);
+        let builder = context.create_builder();
+        builder.position_at_end(context.append_basic_block(function, "entry"));
+        #[cfg(feature = "typed-pointers")]
+        let pointer_type = context.i8_type().ptr_type(AddressSpace::from(270));
+        #[cfg(not(feature = "typed-pointers"))]
+        let pointer_type = context.ptr_type(AddressSpace::from(270));
+        builder.build_alloca(pointer_type, "slot").unwrap();
+        builder.build_return(None).unwrap();
+        module
+    }
+
+    Target::initialize_native(&InitializationConfig::default()).expect("Failed to initialize native target");
+
+    let context = Context::create();
+    let error = global(&context).create_interpreter_execution_engine().unwrap_err();
+    assert_eq!(error.to_string(), POINTER_SIZE.to_string());
+    // The default kind may become the interpreter, so it checks too
+    let error = global(&context).create_execution_engine().unwrap_err();
+    assert_eq!(error.to_string(), POINTER_SIZE.to_string());
+
+    let interpreter = context
+        .create_module("main")
+        .create_interpreter_execution_engine()
+        .unwrap();
+    let refused = interpreter.add_module(global(&context)).unwrap_err();
+    assert_eq!(refused.error, POINTER_SIZE);
+    let refused = interpreter.add_module(alloca(&context)).unwrap_err();
+    assert_eq!(refused.error, POINTER_SIZE);
+
+    let ee = global(&context)
+        .create_jit_execution_engine(OptimizationLevel::None)
+        .unwrap();
+    ee.add_module(alloca(&context)).unwrap();
+}
+
+/// MCJIT builds its target machine from the module's target triple, and its code is called from
+/// this process: a module for another target is refused, whatever its layout.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_jit_refuses_foreign_targets() {
+    use inkwell::targets::TargetTriple;
+
+    Target::initialize_native(&InitializationConfig::default()).expect("Failed to initialize native target");
+
+    let context = Context::create();
+    // Another architecture of the same backend, and the host's architecture with another ABI
+    for triple in ["i386-pc-linux-gnu", "x86_64-pc-windows-msvc"] {
+        let module = context.create_module(triple);
+        module.set_triple(&TargetTriple::create(triple));
+        let error = module.create_jit_execution_engine(OptimizationLevel::None).unwrap_err();
+        assert!(error.to_string().contains(triple), "{error}");
+    }
+
+    // With the host's layout set, the target is still another
+    let module = context.create_module("i386");
+    module.set_triple(&TargetTriple::create("i386-pc-linux-gnu"));
+    let host_layout = context
+        .create_module("host")
+        .create_jit_execution_engine(OptimizationLevel::None)
+        .unwrap()
+        .get_data_layout()
+        .get_string_representation()
+        .to_string_lossy()
+        .into_owned();
+    module.set_data_layout_str(&host_layout);
+    let error = module.create_jit_execution_engine(OptimizationLevel::None).unwrap_err();
+    assert!(error.to_string().contains("i386-pc-linux-gnu"), "{error}");
+
+    // The host's own triple is accepted
+    let module = context.create_module("host");
+    module.set_triple(&TargetMachine::get_default_triple());
+    drop(module.create_jit_execution_engine(OptimizationLevel::None).unwrap());
 }

@@ -441,7 +441,7 @@ fn test_linking_modules() {
     builder.position_at_end(basic_block4);
     builder.build_return(None).unwrap();
 
-    let module6 = execution_engine.add_module(module6);
+    let module6 = execution_engine.add_module(module6).unwrap();
 
     assert_eq!(execution_engine.get_function_value("f4"), Ok(fn_val4));
 

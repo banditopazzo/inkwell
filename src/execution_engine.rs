@@ -1,5 +1,16 @@
 use libc::{c_int, c_void};
-use llvm_sys::core::LLVMDisposeModule;
+use llvm_sys::core::{
+    LLVMAliasGetAliasee, LLVMCountParamTypes, LLVMCountStructElementTypes, LLVMDisposeModule, LLVMGetAllocatedType,
+    LLVMGetCalledFunctionType, LLVMGetDataLayoutStr, LLVMGetElementType, LLVMGetFirstBasicBlock, LLVMGetFirstFunction,
+    LLVMGetFirstGlobal, LLVMGetFirstGlobalAlias, LLVMGetFirstGlobalIFunc, LLVMGetFirstInstruction,
+    LLVMGetGlobalIFuncResolver, LLVMGetInitializer, LLVMGetInstructionOpcode, LLVMGetNextBasicBlock,
+    LLVMGetNextFunction, LLVMGetNextGlobal, LLVMGetNextGlobalAlias, LLVMGetNextGlobalIFunc, LLVMGetNextInstruction,
+    LLVMGetNumOperands, LLVMGetOperand, LLVMGetParamTypes, LLVMGetPointerAddressSpace, LLVMGetReturnType,
+    LLVMGetTypeKind, LLVMGlobalGetValueType, LLVMIsAConstant, LLVMIsAGlobalValue, LLVMSetDataLayout,
+    LLVMStructGetTypeAtIndex, LLVMTypeOf,
+};
+#[llvm_versions(14..)]
+use llvm_sys::core::{LLVMGetConstOpcode, LLVMGetGEPSourceElementType, LLVMIsAConstantExpr};
 use llvm_sys::execution_engine::{
     LLVMAddGlobalMapping, LLVMAddModule, LLVMCreateExecutionEngineForModule, LLVMCreateInterpreterForModule,
     LLVMCreateJITCompilerForModule, LLVMCreateMCJITCompilerForModule, LLVMCreateSimpleMCJITMemoryManager,
@@ -11,25 +22,29 @@ use llvm_sys::execution_engine::{
 
 use crate::OptimizationLevel;
 use crate::context::Context;
-use crate::data_layout::DataLayoutRef;
+use crate::data_layout::{DataLayout, DataLayoutRef};
 use crate::memory_manager::{
     McjitMemoryManager, MemoryManagerAdapter, allocate_code_section_adapter, allocate_data_section_adapter,
     destroy_adapter, finalize_memory_adapter,
 };
 use crate::module::Module;
 use crate::support::{LLVMString, to_c_str};
-use crate::targets::{CodeModel, InitializationConfig, Target, TargetMachineRef};
+use crate::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine, TargetMachineRef};
 use crate::values::{AnyValue, AsValueRef, FunctionValue, GenericValue};
 
-use llvm_sys::LLVMModule;
-use llvm_sys::prelude::{LLVMBool, LLVMModuleRef};
+use llvm_sys::prelude::{LLVMBool, LLVMModuleRef, LLVMTypeRef, LLVMValueRef};
+use llvm_sys::target::LLVMPointerSizeForAS;
+use llvm_sys::{LLVMModule, LLVMOpcode, LLVMTypeKind};
 
 use std::cell::Cell;
+use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
+use std::ffi::CStr;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::mem::{MaybeUninit, size_of, transmute_copy};
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FunctionLookupError {
@@ -52,6 +67,342 @@ impl Display for FunctionLookupError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "FunctionLookupError({})", self.as_str())
     }
+}
+
+/// Why an execution engine cannot take a module.
+///
+/// Every engine runs its modules under the host's data layout: MCJIT generates code that this
+/// process calls, and the interpreter keeps host pointers in memory it shares with native code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataLayoutError {
+    /// The module's data layout is neither empty nor the engine's. MCJIT would end the process
+    /// when compiling the module (`MachineFunction` calls `report_fatal_error` for a layout other
+    /// than the target machine's); the interpreter would run it under the engine's layout, against
+    /// the sizes and offsets the module was built with.
+    LayoutMismatch {
+        /// The module's data layout.
+        module_data_layout: String,
+        /// The engine's data layout.
+        engine_data_layout: String,
+    },
+    /// The module uses pointers of an address space whose size in the engine's data layout is
+    /// not the host's (x86-64's address spaces 270 and 271 are 32-bit). The interpreter stores
+    /// every pointer as a host pointer, into a slot of the layout's size for its address space.
+    PointerSize {
+        /// The address space.
+        address_space: u32,
+        /// Its pointer size in the engine's data layout, in bytes.
+        size: u32,
+        /// The host's pointer size, in bytes.
+        host_size: u32,
+    },
+    /// MCJIT would generate code for another target than the host: it builds its target machine
+    /// from the module's target triple, and its code is called from this process.
+    ForeignTarget {
+        /// The target triple the engine would generate code for.
+        engine_triple: String,
+        /// The host's target triple.
+        host_triple: String,
+    },
+    /// The host's data layout could not be determined.
+    UnknownHost(String),
+}
+
+impl Display for DataLayoutError {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            DataLayoutError::LayoutMismatch {
+                module_data_layout,
+                engine_data_layout,
+            } => write!(
+                f,
+                "the module's data layout `{module_data_layout}` is not the execution engine's `{engine_data_layout}`"
+            ),
+            DataLayoutError::PointerSize {
+                address_space,
+                size,
+                host_size,
+            } => write!(
+                f,
+                "the module uses pointers of address space {address_space}, which are {size} bytes in the execution \
+                 engine's data layout and {host_size} bytes on the host"
+            ),
+            DataLayoutError::ForeignTarget {
+                engine_triple,
+                host_triple,
+            } => write!(
+                f,
+                "the execution engine would generate code for `{engine_triple}`, not for the host `{host_triple}`"
+            ),
+            DataLayoutError::UnknownHost(error) => write!(f, "the host's data layout is unknown: {error}"),
+        }
+    }
+}
+
+impl Error for DataLayoutError {}
+
+/// A module an engine refuses, given back with the reason.
+#[derive(Debug)]
+pub struct IncompatibleDataLayout<'ctx> {
+    /// The refused module.
+    pub module: Module<'ctx>,
+    /// Why the engine refuses it.
+    pub error: DataLayoutError,
+}
+
+impl Display for IncompatibleDataLayout<'_> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        Display::fmt(&self.error, f)
+    }
+}
+
+impl Error for IncompatibleDataLayout<'_> {}
+
+/// The host's target and data layout, computed once from a target machine for LLVM's default
+/// target triple.
+struct Host {
+    triple: String,
+    target: usize,
+    data_layout: String,
+}
+
+/// The host's target and data layout.
+fn host() -> Result<&'static Host, DataLayoutError> {
+    static HOST: OnceLock<Result<Host, String>> = OnceLock::new();
+
+    let host = HOST.get_or_init(|| {
+        Target::initialize_native(&InitializationConfig::default())?;
+        let triple = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&triple).map_err(|error| error.to_string())?;
+        let target_machine = target
+            .create_target_machine(
+                &triple,
+                "",
+                "",
+                OptimizationLevel::None,
+                RelocMode::Default,
+                CodeModel::Default,
+            )
+            .ok_or_else(|| "no target machine for the host's triple".to_owned())?;
+        let data_layout = target_machine.get_data_layout();
+        // LLVM's default triple can be another than this process's (a 32-bit process on a 64-bit
+        // default, say): its layout would not describe this process.
+        let pointer_size = data_layout.get_pointer_byte_size(None) as usize;
+        if pointer_size != size_of::<*mut c_void>() {
+            return Err(format!(
+                "LLVM's default target `{}` has {pointer_size}-byte pointers, this process {}-byte ones",
+                triple.as_str().to_string_lossy(),
+                size_of::<*mut c_void>()
+            ));
+        }
+
+        Ok(Host {
+            triple: triple.as_str().to_string_lossy().into_owned(),
+            target: target.as_mut_ptr() as usize,
+            data_layout: data_layout.get_string_representation().to_string_lossy().into_owned(),
+        })
+    });
+
+    host.as_ref()
+        .map_err(|error| DataLayoutError::UnknownHost(error.clone()))
+}
+
+/// Checks that a module can run under `engine_dl`, the engine's data layout: the module's own,
+/// `module_dl`, is empty or `engine_dl`. (Layouts are compared as strings, which is stricter than
+/// LLVM's semantic comparison: the C API has no other.)
+///
+/// # Safety
+///
+/// `module` must be valid.
+unsafe fn check_data_layout(module: LLVMModuleRef, engine_dl: &str) -> Result<(), DataLayoutError> {
+    let module_dl = unsafe { CStr::from_ptr(LLVMGetDataLayoutStr(module)) };
+
+    if module_dl.is_empty() || module_dl.to_bytes() == engine_dl.as_bytes() {
+        Ok(())
+    } else {
+        Err(DataLayoutError::LayoutMismatch {
+            module_data_layout: module_dl.to_string_lossy().into_owned(),
+            engine_data_layout: engine_dl.to_owned(),
+        })
+    }
+}
+
+/// Gives a module without a data layout `engine_dl`. MCJIT does that itself; the interpreter
+/// would run the module under LLVM's default layout, which is not the host's.
+///
+/// # Safety
+///
+/// `module` must be valid.
+unsafe fn set_empty_data_layout(module: LLVMModuleRef, engine_dl: &str) {
+    if unsafe { CStr::from_ptr(LLVMGetDataLayoutStr(module)) }.is_empty() {
+        unsafe { LLVMSetDataLayout(module, to_c_str(engine_dl).as_ptr()) }
+    }
+}
+
+/// Checks that the interpreter can store host pointers for every pointer type `module` uses:
+/// their address spaces have the host's pointer size in `engine_dl`. The interpreter stores every
+/// pointer as a host pointer, into a slot of the layout's size for its address space, and its
+/// constructor already does so for the first module's globals (`ExecutionEngine::emitGlobals`).
+///
+/// # Safety
+///
+/// `module` must be valid.
+unsafe fn check_interpreter_pointers(module: LLVMModuleRef, engine_dl: &str) -> Result<(), DataLayoutError> {
+    let engine_dl = DataLayout::create(engine_dl);
+    let host_size = size_of::<*mut c_void>() as u32;
+
+    for address_space in unsafe { pointer_address_spaces(module) } {
+        let size = unsafe { LLVMPointerSizeForAS(engine_dl.as_mut_ptr(), address_space) };
+        if size != host_size {
+            return Err(DataLayoutError::PointerSize {
+                address_space,
+                size,
+                host_size,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// The address spaces of the pointer types `module` uses: in the types of its globals, aliases,
+/// ifuncs, functions, instructions and constants, and in the types instructions and constant
+/// expressions name (allocations, GEP source element types, call signatures), down through
+/// aggregate and function types.
+///
+/// # Safety
+///
+/// `module` must be valid.
+unsafe fn pointer_address_spaces(module: LLVMModuleRef) -> BTreeSet<u32> {
+    #[derive(Default)]
+    struct Walk {
+        address_spaces: BTreeSet<u32>,
+        types: HashSet<LLVMTypeRef>,
+        values: HashSet<LLVMValueRef>,
+    }
+
+    impl Walk {
+        unsafe fn ty(&mut self, ty: LLVMTypeRef) {
+            if ty.is_null() || !self.types.insert(ty) {
+                return;
+            }
+            unsafe {
+                match LLVMGetTypeKind(ty) {
+                    LLVMTypeKind::LLVMPointerTypeKind => {
+                        self.address_spaces.insert(LLVMGetPointerAddressSpace(ty));
+                        #[cfg(feature = "typed-pointers")]
+                        self.ty(LLVMGetElementType(ty));
+                    },
+                    LLVMTypeKind::LLVMStructTypeKind => {
+                        for index in 0..LLVMCountStructElementTypes(ty) {
+                            self.ty(LLVMStructGetTypeAtIndex(ty, index));
+                        }
+                    },
+                    LLVMTypeKind::LLVMArrayTypeKind
+                    | LLVMTypeKind::LLVMVectorTypeKind
+                    | LLVMTypeKind::LLVMScalableVectorTypeKind => self.ty(LLVMGetElementType(ty)),
+                    LLVMTypeKind::LLVMFunctionTypeKind => {
+                        self.ty(LLVMGetReturnType(ty));
+                        let mut params = vec![std::ptr::null_mut(); LLVMCountParamTypes(ty) as usize];
+                        LLVMGetParamTypes(ty, params.as_mut_ptr());
+                        for param in params {
+                            self.ty(param);
+                        }
+                    },
+                    _ => {},
+                }
+            }
+        }
+
+        /// A value's type and, for a constant that is not a global, its operands'. Globals are
+        /// walked from the module's lists; arguments, basic blocks and metadata have no operands
+        /// to walk.
+        unsafe fn value(&mut self, value: LLVMValueRef) {
+            if value.is_null() || !self.values.insert(value) {
+                return;
+            }
+            unsafe {
+                self.ty(LLVMTypeOf(value));
+                if LLVMIsAConstant(value).is_null() || !LLVMIsAGlobalValue(value).is_null() {
+                    return;
+                }
+                // Typed pointers name the source element type in the pointer operand's type.
+                #[cfg(not(any(feature = "llvm12-0", feature = "llvm13-0")))]
+                if !LLVMIsAConstantExpr(value).is_null() && LLVMGetConstOpcode(value) == LLVMOpcode::LLVMGetElementPtr {
+                    self.ty(LLVMGetGEPSourceElementType(value));
+                }
+                for index in 0..LLVMGetNumOperands(value) {
+                    self.value(LLVMGetOperand(value, index as u32));
+                }
+            }
+        }
+
+        unsafe fn instruction(&mut self, instruction: LLVMValueRef) {
+            unsafe {
+                self.value(instruction);
+                for index in 0..LLVMGetNumOperands(instruction) {
+                    self.value(LLVMGetOperand(instruction, index as u32));
+                }
+                match LLVMGetInstructionOpcode(instruction) {
+                    LLVMOpcode::LLVMAlloca => self.ty(LLVMGetAllocatedType(instruction)),
+                    #[cfg(not(any(feature = "llvm12-0", feature = "llvm13-0")))]
+                    LLVMOpcode::LLVMGetElementPtr => self.ty(LLVMGetGEPSourceElementType(instruction)),
+                    LLVMOpcode::LLVMCall | LLVMOpcode::LLVMInvoke | LLVMOpcode::LLVMCallBr => {
+                        self.ty(LLVMGetCalledFunctionType(instruction))
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    let mut walk = Walk::default();
+    unsafe {
+        let mut global = LLVMGetFirstGlobal(module);
+        while !global.is_null() {
+            walk.value(global);
+            walk.ty(LLVMGlobalGetValueType(global));
+            walk.value(LLVMGetInitializer(global));
+            global = LLVMGetNextGlobal(global);
+        }
+        let mut alias = LLVMGetFirstGlobalAlias(module);
+        while !alias.is_null() {
+            walk.value(alias);
+            walk.value(LLVMAliasGetAliasee(alias));
+            alias = LLVMGetNextGlobalAlias(alias);
+        }
+        let mut ifunc = LLVMGetFirstGlobalIFunc(module);
+        while !ifunc.is_null() {
+            walk.value(ifunc);
+            walk.value(LLVMGetGlobalIFuncResolver(ifunc));
+            ifunc = LLVMGetNextGlobalIFunc(ifunc);
+        }
+        let mut function = LLVMGetFirstFunction(module);
+        while !function.is_null() {
+            walk.value(function);
+            walk.ty(LLVMGlobalGetValueType(function));
+            let mut block = LLVMGetFirstBasicBlock(function);
+            while !block.is_null() {
+                let mut instruction = LLVMGetFirstInstruction(block);
+                while !instruction.is_null() {
+                    walk.instruction(instruction);
+                    instruction = LLVMGetNextInstruction(instruction);
+                }
+                block = LLVMGetNextBasicBlock(block);
+            }
+            function = LLVMGetNextFunction(function);
+        }
+    }
+
+    walk.address_spaces
+}
+
+/// An error message as an [`LLVMString`], as the engine constructors return.
+fn error_message(error: impl Display) -> LLVMString {
+    let mut message = error.to_string();
+    message.push('\0');
+
+    LLVMString::create_from_str(&message)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -108,6 +459,14 @@ impl Display for RemoveModuleError<'_> {
 ///
 /// If several modules define the same symbol, MCJIT does not report an error: whichever
 /// definition is linked last wins, and which module gets compiled for a lookup is unspecified.
+///
+/// Every engine runs its modules under the host's data layout
+/// ([`get_data_layout`](Self::get_data_layout)): MCJIT generates code that this process calls, and
+/// the interpreter keeps host pointers in memory it shares with native code. A module must have
+/// that layout or none, in which case it is given it; one with another is refused
+/// ([`DataLayoutError`]). So is, at creation, a module whose target triple would make MCJIT
+/// generate code for another target, and, for the interpreter, a module using pointers of an
+/// address space whose size in that layout is not the host's.
 #[derive(Debug)]
 pub struct ExecutionEngine<'ctx> {
     execution_engine: NonNull<llvm_sys::execution_engine::LLVMOpaqueExecutionEngine>,
@@ -167,7 +526,12 @@ impl<'ctx> ExecutionEngine<'ctx> {
         Self::link_in_mc_jit();
         Self::link_in_interpreter();
 
-        unsafe { Self::create(module, |out, err| LLVMCreateExecutionEngineForModule(out, module, err)) }
+        // LLVM picks the interpreter if the target has no JIT.
+        unsafe {
+            Self::create(module, true, |out, err| {
+                LLVMCreateExecutionEngineForModule(out, module, err)
+            })
+        }
     }
 
     /// Creates an interpreter around a raw module. The safe form is
@@ -179,7 +543,11 @@ impl<'ctx> ExecutionEngine<'ctx> {
     pub unsafe fn create_interpreter_for_module(module: LLVMModuleRef) -> Result<Self, LLVMString> {
         Self::link_in_interpreter();
 
-        unsafe { Self::create(module, |out, err| LLVMCreateInterpreterForModule(out, module, err)) }
+        unsafe {
+            Self::create(module, true, |out, err| {
+                LLVMCreateInterpreterForModule(out, module, err)
+            })
+        }
     }
 
     /// Creates an MCJIT engine around a raw module. The safe form is
@@ -195,7 +563,7 @@ impl<'ctx> ExecutionEngine<'ctx> {
         Self::link_in_mc_jit();
 
         unsafe {
-            Self::create(module, |out, err| {
+            Self::create(module, false, |out, err| {
                 LLVMCreateJITCompilerForModule(out, module, opt_level as u32, err)
             })
         }
@@ -258,7 +626,7 @@ impl<'ctx> ExecutionEngine<'ctx> {
         options.MCJMM = mmgr;
 
         unsafe {
-            Self::create(module, |out, err| {
+            Self::create(module, false, |out, err| {
                 LLVMCreateMCJITCompilerForModule(out, module, &mut options, size_of::<LLVMMCJITCompilerOptions>(), err)
             })
         }
@@ -266,17 +634,32 @@ impl<'ctx> ExecutionEngine<'ctx> {
 
     /// Shared body of the `create_*_for_module` constructors: `create` is the
     /// `LLVMCreate*ForModule` call, which takes ownership of `module` and destroys it on failure.
+    /// `interpreter` is whether it can create an interpreter.
     unsafe fn create(
         module: LLVMModuleRef,
+        interpreter: bool,
         create: impl FnOnce(*mut LLVMExecutionEngineRef, *mut *mut ::libc::c_char) -> LLVMBool,
     ) -> Result<Self, LLVMString> {
-        if let Err(mut err_string) = Target::initialize_native(&InitializationConfig::default()) {
-            // The module is ours whether or not an engine gets created.
-            unsafe { LLVMDisposeModule(module) };
-            err_string.push('\0');
+        // Before LLVM sees the module: the interpreter's constructor already stores the module's
+        // globals (`ExecutionEngine::emitGlobals`).
+        let checked = host().and_then(|host| unsafe {
+            check_data_layout(module, &host.data_layout)?;
+            if interpreter {
+                check_interpreter_pointers(module, &host.data_layout)?;
+            }
+            set_empty_data_layout(module, &host.data_layout);
 
-            return Err(LLVMString::create_from_str(&err_string));
-        }
+            Ok(host)
+        });
+        let host = match checked {
+            Ok(host) => host,
+            Err(error) => {
+                // The module is ours whether or not an engine gets created.
+                unsafe { LLVMDisposeModule(module) };
+
+                return Err(error_message(error));
+            },
+        };
 
         let mut execution_engine = MaybeUninit::uninit();
         let mut err_string: *mut ::libc::c_char = ::core::ptr::null_mut();
@@ -285,7 +668,27 @@ impl<'ctx> ExecutionEngine<'ctx> {
         }
 
         // LLVM created the engine around `module` and owns nothing else yet.
-        Ok(unsafe { Self::new(execution_engine.assume_init(), module) })
+        let execution_engine = unsafe { Self::new(execution_engine.assume_init(), module) };
+
+        // MCJIT builds its target machine from the module's target triple. Dropping the engine
+        // destroys the module, as on failure.
+        let foreign = execution_engine.get_target_machine().and_then(|target_machine| {
+            let engine_dl = execution_engine.get_data_layout().get_string_representation();
+            let same = target_machine.get_target().as_mut_ptr() as usize == host.target
+                && engine_dl.to_bytes() == host.data_layout.as_bytes();
+
+            (!same).then(|| DataLayoutError::ForeignTarget {
+                engine_triple: target_machine.get_triple().as_str().to_string_lossy().into_owned(),
+                host_triple: host.triple.clone(),
+            })
+        });
+        if let Some(error) = foreign {
+            drop(execution_engine);
+
+            return Err(error_message(error));
+        }
+
+        Ok(execution_engine)
     }
 
     /// Whether `finalizeObject` has an object to work on: something already loaded, or owned
@@ -314,7 +717,9 @@ impl<'ctx> ExecutionEngine<'ctx> {
     /// added with [`add_module`](Self::add_module) nor tracked before, and not the module the
     /// engine was created around (see [`take_initial_loaded_module`](Self::take_initial_loaded_module)). A second
     /// handle would let the module be removed twice, and `LLVMRemoveModule` hands back a module
-    /// it does not own.
+    /// it does not own. It must pass the checks of [`add_module`](Self::add_module): its data
+    /// layout the engine's, and, on the interpreter, its pointer address spaces the host's size
+    /// (see [`DataLayoutError`]).
     pub unsafe fn track_module(&self, module: LLVMModuleRef) -> EngineModule<'_> {
         let module = NonNull::new(module).expect("module must be non-null");
 
@@ -405,6 +810,12 @@ impl<'ctx> ExecutionEngine<'ctx> {
     /// The returned [`EngineModule`] is the only way to refer to the module afterwards, gives no
     /// access to its contents, and borrows the engine, so it cannot outlive it.
     ///
+    /// # Errors
+    ///
+    /// [`IncompatibleDataLayout`], with the module and a [`DataLayoutError`], if its data layout
+    /// is neither empty nor the engine's, or, on the interpreter, if it uses pointers of an address
+    /// space whose size in that layout is not the host's.
+    ///
     /// ```rust,no_run
     /// use inkwell::targets::{InitializationConfig, Target};
     /// use inkwell::context::Context;
@@ -415,18 +826,33 @@ impl<'ctx> ExecutionEngine<'ctx> {
     /// let context = Context::create();
     /// let ee = context.create_module("main").create_jit_execution_engine(OptimizationLevel::None).unwrap();
     ///
-    /// let helpers = ee.add_module(context.create_module("helpers"));
+    /// let helpers = ee.add_module(context.create_module("helpers")).unwrap();
     /// // ... look up and run functions ...
     /// let helpers = ee.remove_module(helpers).unwrap();
     /// assert_eq!(helpers.get_name().to_str(), Ok("helpers"));
     /// ```
-    pub fn add_module(&self, module: Module<'ctx>) -> EngineModule<'_> {
+    pub fn add_module(&self, module: Module<'ctx>) -> Result<EngineModule<'_>, IncompatibleDataLayout<'ctx>> {
+        let engine_dl = self
+            .get_data_layout()
+            .get_string_representation()
+            .to_string_lossy()
+            .into_owned();
+        let checked = unsafe {
+            check_data_layout(module.as_mut_ptr(), &engine_dl).and_then(|()| match self.get_target_machine() {
+                Some(_) => Ok(()),
+                None => check_interpreter_pointers(module.as_mut_ptr(), &engine_dl),
+            })
+        };
+        if let Err(error) = checked {
+            return Err(IncompatibleDataLayout { module, error });
+        }
+        unsafe { set_empty_data_layout(module.as_mut_ptr(), &engine_dl) };
         let module = module.into_raw();
 
         unsafe { LLVMAddModule(self.execution_engine_inner(), module) }
 
         // SAFETY: just added to this engine, and not tracked before.
-        unsafe { self.track_module(module) }
+        Ok(unsafe { self.track_module(module) })
     }
 
     /// Takes a module back from the engine.
@@ -732,7 +1158,7 @@ impl Drop for ExecutionEngine<'_> {
 ///
 /// let context = Context::create();
 /// let ee = context.create_module("main").create_jit_execution_engine(OptimizationLevel::None).unwrap();
-/// let helpers = ee.add_module(context.create_module("helpers"));
+/// let helpers = ee.add_module(context.create_module("helpers")).unwrap();
 /// drop(ee); // error: `ee` is borrowed by `helpers`
 /// let _ = helpers.as_mut_ptr();
 /// ```
